@@ -1,5 +1,5 @@
 package com.example.addon;
-
+import com.example.addon.modules.AutoSellPro;
 import com.example.addon.commands.CommandExample;
 import com.example.addon.hud.HudExample;
 import com.example.addon.modules.ModuleExample;
@@ -23,7 +23,7 @@ public class AddonTemplate extends MeteorAddon {
         LOG.info("Initializing Meteor Addon Template");
 
         // Modules
-        Modules.get().add(new ModuleExample());
+        Modules.get().add(new AutoSellPro());
 
         // Commands
         Commands.add(new CommandExample());
