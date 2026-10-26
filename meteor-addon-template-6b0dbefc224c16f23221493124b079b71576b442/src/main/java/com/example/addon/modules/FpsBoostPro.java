@@ -7,7 +7,7 @@ import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import net.minecraft.client.option.CloudRenderMode;
-import net.minecraft.client.option.ParticlesMode;
+import net.minecraft.client.option.SimpleOption;
 
 /**
  * Lowers expensive video settings while enabled and restores your original values when disabled.
@@ -96,7 +96,7 @@ public class FpsBoostPro extends Module {
     private int oldRender;
     private int oldSimulation;
     private double oldEntityDistance;
-    private ParticlesMode oldParticles;
+    private Object oldParticles;
     private CloudRenderMode oldClouds;
     private boolean oldShadows;
     private int oldBlend;
@@ -127,13 +127,27 @@ public class FpsBoostPro extends Module {
         mc.options.getViewDistance().setValue(renderDistance.get());
         mc.options.getSimulationDistance().setValue(simulationDistance.get());
         mc.options.getEntityDistanceScaling().setValue(entityDistance.get() / 100.0);
-        if (minimalParticles.get()) mc.options.getParticles().setValue(ParticlesMode.MINIMAL);
+        if (minimalParticles.get()) setLastValue(mc.options.getParticles());
         if (noClouds.get()) mc.options.getCloudRenderMode().setValue(CloudRenderMode.OFF);
         if (noShadows.get()) mc.options.getEntityShadows().setValue(false);
         if (noBlend.get()) mc.options.getBiomeBlendRadius().setValue(0);
         if (noBobbing.get()) mc.options.getBobView().setValue(false);
         if (unlimitedFps.get()) mc.options.getMaxFps().setValue(260);
         if (noVsync.get()) mc.options.getEnableVsync().setValue(false);
+    }
+
+    /** Sets an enum option to its last constant (for particles: ALL, DECREASED, MINIMAL -> MINIMAL). */
+    @SuppressWarnings("unchecked")
+    private static <T> void setLastValue(SimpleOption<T> option) {
+        Object[] constants = option.getValue().getClass().getEnumConstants();
+        if (constants != null && constants.length > 0) {
+            option.setValue((T) constants[constants.length - 1]);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> void restoreValue(SimpleOption<T> option, Object value) {
+        if (value != null) option.setValue((T) value);
     }
 
     @Override
@@ -143,7 +157,7 @@ public class FpsBoostPro extends Module {
         mc.options.getViewDistance().setValue(oldRender);
         mc.options.getSimulationDistance().setValue(oldSimulation);
         mc.options.getEntityDistanceScaling().setValue(oldEntityDistance);
-        mc.options.getParticles().setValue(oldParticles);
+        restoreValue(mc.options.getParticles(), oldParticles);
         mc.options.getCloudRenderMode().setValue(oldClouds);
         mc.options.getEntityShadows().setValue(oldShadows);
         mc.options.getBiomeBlendRadius().setValue(oldBlend);
