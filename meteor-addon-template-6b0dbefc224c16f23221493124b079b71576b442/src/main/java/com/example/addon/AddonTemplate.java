@@ -3,6 +3,7 @@ package com.example.addon;
 import com.example.addon.modules.AutoSellPro;
 import com.example.addon.modules.AutoEatPro;
 import com.example.addon.modules.AutoPayPro;
+import com.example.addon.modules.KillAuraPro;
 import com.example.addon.commands.CommandExample;
 import com.example.addon.hud.HudExample;
 import com.example.addon.modules.ModuleExample;
@@ -29,6 +30,7 @@ public class AddonTemplate extends MeteorAddon {
         Modules.get().add(new AutoSellPro());
         Modules.get().add(new AutoEatPro());
         Modules.get().add(new AutoPayPro());
+        Modules.get().add(new KillAuraPro());
 
         // Commands
         Commands.add(new CommandExample());
