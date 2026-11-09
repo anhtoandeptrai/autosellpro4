@@ -30,7 +30,6 @@ import java.util.concurrent.ThreadLocalRandom;
 /** AutoSellPro - ghost-item fix (batching, rollback detection, resync). */
 public class AutoSellPro extends Module {
     private static final int INVENTORY_SIZE = 36;
-    private static final int GUI_STABILIZE_TICKS = 5;
     private static final String SELL_GUI_TITLE = "sell";
     private static final int EXPECTED_GUI_ROWS = 6;
     private static final int INPUT_SLOT_END = 44;
@@ -120,6 +119,14 @@ public class AutoSellPro extends Module {
         .defaultValue(1)
         .range(0, 10)
         .sliderRange(0, 5)
+        .build());
+
+    private final Setting<Integer> stabilizeTicks = sgDelays.add(new IntSetting.Builder()
+        .name("gui-stabilize-ticks")
+        .description("Ticks to wait after the sell GUI opens before the first click. Lower = GUI is open for less time.")
+        .defaultValue(3)
+        .range(1, 20)
+        .sliderRange(1, 10)
         .build());
 
     private final Setting<Integer> confirmDelayTicks = sgDelays.add(new IntSetting.Builder()
@@ -266,7 +273,7 @@ public class AutoSellPro extends Module {
             abortManualClose();
             return;
         }
-        if (stateTicks >= GUI_STABILIZE_TICKS) setState(State.MOVING);
+        if (stateTicks >= stabilizeTicks.get()) setState(State.MOVING);
     }
 
     private void tickMoving() {
@@ -468,6 +475,7 @@ public class AutoSellPro extends Module {
 
     private void beginResync(boolean closeGui, boolean verify, long cooldownMs) {
         if (closeGui && mc.player != null && isSellScreen()) mc.player.closeHandledScreen();
+        restoreKillAura(); // GUI is gone -> give KillAura back immediately, resync runs in the background
         resyncVerify = verify;
         resyncCooldownMs = cooldownMs;
         queueBuilt = false;
