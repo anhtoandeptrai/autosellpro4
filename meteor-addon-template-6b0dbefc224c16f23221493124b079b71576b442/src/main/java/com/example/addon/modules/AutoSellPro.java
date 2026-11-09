@@ -171,6 +171,7 @@ public class AutoSellPro extends Module {
     private long cooldownEndTime;
 
     // ---- NEW fields ----
+    private boolean sessionFailed;
     private int adaptiveBatch;
     private int slowTicks;
     private int cleanStreak;
@@ -311,8 +312,8 @@ public class AutoSellPro extends Module {
         }
 
         movedLastRound = moved;
-        expectedInvWl = countWhitelistedInHandler(handler, invStart);
-        dbg("batch moved=" + moved + " limit=" + limit + " invWhitelistedLeft=" + expectedInvWl);
+        expectedInvWl = guiFilled(handler);
+        dbg("batch moved=" + moved + " limit=" + limit + " guiFilled=" + expectedInvWl + " invWhitelistedLeft=" + countWhitelistedInHandler(handler, invStart));
 
         if (moved == 0) {
             if (round == 0) warning("Sell GUI input slots are full or nothing could be moved.");
@@ -338,8 +339,15 @@ public class AutoSellPro extends Module {
         return n;
     }
 
+    private int guiFilled(ScreenHandler handler) {
+        return INPUT_SLOT_END + 1 - freeInputSlots(handler);
+    }
+
+    // Items we put into the sell GUI never leave it by themselves while we are still moving/confirming.
+    // If the number of filled GUI slots DROPS, the server removed/returned them (rate limit / rollback).
+    // Only the GUI is looked at, so items picked up from farming can't trigger a false alarm.
     private boolean rollbackDetected(ScreenHandler handler, int invStart) {
-        return expectedInvWl >= 0 && countWhitelistedInHandler(handler, invStart) > expectedInvWl;
+        return expectedInvWl >= 0 && guiFilled(handler) < expectedInvWl;
     }
 
     private void onRollback() {
@@ -347,9 +355,11 @@ public class AutoSellPro extends Module {
         adaptiveBatch = Math.max(1, adaptiveBatch / 2);
         slowTicks = Math.min(4, slowTicks + 1);
         cleanStreak = 0;
-        warning("Server returned items while moving (click rate limit). Slowing down: batch " + before + " -> " + adaptiveBatch + ", +" + slowTicks + " ticks.");
-        dbg("ROLLBACK detected, batch=" + adaptiveBatch + " slowTicks=" + slowTicks);
-        finish(true);
+        failStreak++;
+        sessionFailed = true;
+        warning("Server returned items while moving (click rate limit). Slowing down: batch " + before + " -> " + adaptiveBatch + ", +" + slowTicks + " ticks. (" + failStreak + "/" + maxFails.get() + ")");
+        dbg("ROLLBACK detected, guiFilled dropped below " + expectedInvWl + ", batch=" + adaptiveBatch + " slowTicks=" + slowTicks);
+        beginResync(true, false, 0);
     }
 
     private void tickConfirming() {
@@ -442,27 +452,22 @@ public class AutoSellPro extends Module {
         long cooldownMs = resyncCooldownMs;
         boolean disableModule = false;
 
-        if (resyncVerify) {
-            int after = countWhitelistedInInventory();
+        if (sessionFailed) {
             long base = Math.max(1, cooldownSeconds.get());
-
-            dbg("verify before=" + whitelistedBefore + " after=" + after);
-            if (after < whitelistedBefore) {
-                failStreak = 0;
-                cooldownMs = cooldownSeconds.get() * 1000L;
-                if (++cleanStreak >= 3) {
-                    cleanStreak = 0;
-                    if (slowTicks > 0) slowTicks--;
-                    else adaptiveBatch = Math.min(batchSize.get(), adaptiveBatch + 1);
-                }
-            } else {
-                failStreak++;
-                cooldownMs = Math.min(MAX_BACKOFF_SECONDS, base << Math.min(failStreak, 6)) * 1000L;
-                warning("Sell did not go through (blocked by server/anti-cheat?) " + failStreak + "/" + maxFails.get() + ".");
-                if (failStreak >= maxFails.get()) {
-                    warning("Too many failed sells in a row - disabling auto-sell to avoid more ghost items.");
-                    disableModule = true;
-                }
+            cooldownMs = Math.min(MAX_BACKOFF_SECONDS, base << Math.min(failStreak, 6)) * 1000L;
+            if (failStreak >= maxFails.get()) {
+                warning("Too many failed sells in a row - disabling auto-sell to avoid more ghost items.");
+                disableModule = true;
+            }
+        } else if (resyncVerify) {
+            // Session ended normally. (The inventory count is only logged: farm drops make it useless as a verdict.)
+            dbg("session ok, whitelisted stacks before=" + whitelistedBefore + " now=" + countWhitelistedInInventory());
+            failStreak = 0;
+            cooldownMs = cooldownSeconds.get() * 1000L;
+            if (++cleanStreak >= 3) {
+                cleanStreak = 0;
+                if (slowTicks > 0) slowTicks--;
+                else adaptiveBatch = Math.min(batchSize.get(), adaptiveBatch + 1);
             }
         }
 
@@ -506,6 +511,7 @@ public class AutoSellPro extends Module {
         touchQueue.clear();
         expectedInvWl = -1;
         moveWait = 0;
+        sessionFailed = false;
     }
 
     private void setState(State next) {
