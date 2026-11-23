@@ -3,6 +3,7 @@ package com.example.addon.modules;
 import com.example.addon.AddonTemplate;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.BoolSetting;
+import meteordevelopment.meteorclient.settings.EnumSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
 import meteordevelopment.meteorclient.settings.ItemListSetting;
 import meteordevelopment.meteorclient.settings.Setting;
@@ -11,7 +12,6 @@ import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.systems.modules.combat.KillAura;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.screen.GenericContainerScreenHandler;
@@ -23,23 +23,22 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.LocalTime;
 import java.util.ArrayDeque;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * AutoSellPro - v2 (latency-aware).
+ * AutoSellPro - now with two sell modes:
  *
- * Main change vs v1: a drop in the number of items inside the sell GUI is NO LONGER treated as a
- * rollback straight away. With high ping the server's replies to earlier clicks arrive while the
- * client has already predicted later clicks, so the GUI "flickers" back to an older state. v1 read
- * that as a rollback, closed the GUI in the middle of the sale and then spammed ~70 pickup/putback
- * clicks, which is what actually produced the ghost items.
- *
- * v2 sends a batch, WAITS for the server to answer (ack-wait-ticks, grows automatically with your
- * ping), and only then compares the real GUI content with what it expects. Only a drop that is
- * still there after the wait counts as a real rejection.
+ *  FAST : all whitelisted stacks go into /sell in ONE tick, tiny delays, no inventory resync.
+ *  SAFE : the old anti-ghost behaviour (small batches, long ack waits, resync after failures).
+ *  AUTO : starts FAST. As soon as the server rejects / returns items (ghost / ROLLBACK risk)
+ *         it drops to SAFE for N clean sells, then goes back to FAST.
  */
 public class AutoSellPro extends Module {
+    public enum Mode { AUTO, FAST, SAFE }
+
     private static final int INVENTORY_SIZE = 36;
     private static final String SELL_GUI_TITLE = "sell";
     private static final int EXPECTED_GUI_ROWS = 6;
@@ -51,7 +50,21 @@ public class AutoSellPro extends Module {
     private static final int MAX_ACK_EXTRA = 20;
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
-    private final SettingGroup sgDelays = settings.createGroup("Delays");
+    private final SettingGroup sgFast = settings.createGroup("Fast mode");
+    private final SettingGroup sgDelays = settings.createGroup("Delays (safe mode)");
+
+    // ---------------- general ----------------
+    private final Setting<Mode> mode = sgGeneral.add(new EnumSetting.Builder<Mode>()
+        .name("mode")
+        .description("AUTO = fast, falls back to safe (anti-ghost) when the server rejects. FAST = always fast. SAFE = always slow/anti-ghost.")
+        .defaultValue(Mode.AUTO)
+        .build());
+
+    private final Setting<Integer> safeSellsBeforeFast = sgGeneral.add(new IntSetting.Builder()
+        .name("safe-sells-before-fast")
+        .description("AUTO mode: number of clean SAFE sells before trying FAST again.")
+        .defaultValue(3).range(1, 20).sliderRange(1, 10)
+        .build());
 
     private final Setting<List<Item>> whitelist = sgGeneral.add(new ItemListSetting.Builder()
         .name("whitelist")
@@ -61,8 +74,14 @@ public class AutoSellPro extends Module {
 
     private final Setting<Integer> minStacks = sgGeneral.add(new IntSetting.Builder()
         .name("min-stacks")
-        .description("Auto-sell triggers when the inventory has no free slot AND at least this many whitelisted stacks.")
+        .description("Auto-sell triggers when the inventory is full (see trigger-free-slots) AND at least this many whitelisted stacks.")
         .defaultValue(1).range(1, 36).sliderRange(1, 36)
+        .build());
+
+    private final Setting<Integer> triggerFreeSlots = sgGeneral.add(new IntSetting.Builder()
+        .name("trigger-free-slots")
+        .description("Auto-sell as soon as the inventory has this many free slots or fewer (0 = only when completely full). Example: 2 sells while 2 slots are still free, so drops are never lost.")
+        .defaultValue(0).range(0, 35).sliderRange(0, 10)
         .build());
 
     private final Setting<Integer> manualCloseDelaySeconds = sgGeneral.add(new IntSetting.Builder()
@@ -79,13 +98,13 @@ public class AutoSellPro extends Module {
 
     private final Setting<Boolean> resyncEnabled = sgGeneral.add(new BoolSetting.Builder()
         .name("ghost-item-resync")
-        .description("After a failed/aborted sell session, touch the inventory slots to force the server to reconcile ghost items.")
-        .defaultValue(true)
+        .description("After a failed/aborted sell session, touch the inventory slots to force the server to reconcile ghost items (slow).")
+        .defaultValue(false)
         .build());
 
     private final Setting<Boolean> resyncAlways = sgGeneral.add(new BoolSetting.Builder()
         .name("resync-always")
-        .description("Also run the slot resync after every CLEAN sell (slow, ~2-4s of extra clicks). Leave off unless you still see ghost items after a good sell.")
+        .description("SAFE mode only: also run the slot resync after every CLEAN sell (slow). Leave off unless you still see ghost items after a good sell.")
         .defaultValue(false)
         .build());
 
@@ -95,12 +114,56 @@ public class AutoSellPro extends Module {
         .defaultValue(false)
         .build());
 
-    private final Setting<Integer> maxFails = sgGeneral.add(new IntSetting.Builder()
-        .name("max-failed-sells")
-        .description("Disable the module after this many failed sells in a row.")
-        .defaultValue(3).range(1, 10).sliderRange(1, 10)
+    private final Setting<Integer> ghostRetryMinutes = sgGeneral.add(new IntSetting.Builder()
+        .name("ghost-retry-minutes")
+        .description("A slot the server rejects (ghost item) is skipped for this many minutes, then tried again. Everything else keeps selling; the module never turns itself off.")
+        .defaultValue(3).range(1, 120).sliderRange(1, 30)
         .build());
 
+    // ---------------- fast mode ----------------
+    private final Setting<Integer> fastBatch = sgFast.add(new IntSetting.Builder()
+        .name("fast-batch-size")
+        .description("Stacks shift-clicked in ONE tick in fast mode (45 = everything at once).")
+        .defaultValue(45).range(1, 45).sliderRange(1, 45)
+        .build());
+
+    private final Setting<Integer> fastAckWait = sgFast.add(new IntSetting.Builder()
+        .name("fast-ack-wait")
+        .description("Ticks to wait after the batch before checking that the server accepted it. Raise it if your ping is high (ping 150ms ~ 3 ticks).")
+        .defaultValue(3).range(1, 20).sliderRange(1, 10)
+        .build());
+
+    private final Setting<Integer> fastStabilize = sgFast.add(new IntSetting.Builder()
+        .name("fast-stabilize")
+        .description("Ticks to wait after the sell GUI opens before the first click.")
+        .defaultValue(1).range(1, 10).sliderRange(1, 5)
+        .build());
+
+    private final Setting<Integer> fastConfirmDelay = sgFast.add(new IntSetting.Builder()
+        .name("fast-confirm-delay")
+        .description("Ticks between the batch check and clicking confirm.")
+        .defaultValue(1).range(0, 10).sliderRange(0, 5)
+        .build());
+
+    private final Setting<Integer> fastPostSell = sgFast.add(new IntSetting.Builder()
+        .name("fast-post-sell-delay")
+        .description("Ticks to wait after confirming before closing the GUI.")
+        .defaultValue(3).range(0, 20).sliderRange(0, 10)
+        .build());
+
+    private final Setting<Integer> fastCloseDelay = sgFast.add(new IntSetting.Builder()
+        .name("fast-close-delay")
+        .description("Ticks to wait after the GUI closes before the session is considered done.")
+        .defaultValue(2).range(0, 20).sliderRange(0, 10)
+        .build());
+
+    private final Setting<Integer> fastCooldown = sgFast.add(new IntSetting.Builder()
+        .name("fast-cooldown-seconds")
+        .description("Minimum pause between two fast sells.")
+        .defaultValue(1).range(0, 20).sliderRange(0, 10)
+        .build());
+
+    // ---------------- safe mode delays (unchanged) ----------------
     private final Setting<Integer> guiTimeoutSeconds = sgDelays.add(new IntSetting.Builder()
         .name("gui-timeout-seconds")
         .description("Maximum wait time in seconds for the sell GUI.")
@@ -127,7 +190,7 @@ public class AutoSellPro extends Module {
 
     private final Setting<Integer> ackWaitTicks = sgDelays.add(new IntSetting.Builder()
         .name("ack-wait-ticks")
-        .description("Ticks to wait after each batch for the SERVER to answer before checking the GUI. Should be a bit more than your ping (ping 250ms = 5 ticks -> use 8). Grows automatically when the server keeps returning items.")
+        .description("Ticks to wait after each batch for the SERVER to answer before checking the GUI. Should be a bit more than your ping. Grows automatically when the server keeps returning items.")
         .defaultValue(8).range(2, 40).sliderRange(2, 20)
         .build());
 
@@ -161,6 +224,7 @@ public class AutoSellPro extends Module {
         .defaultValue(8).range(0, 40).sliderRange(0, 20)
         .build());
 
+    // ---------------- runtime state ----------------
     private State state = State.IDLE;
     private int stateTicks;
     private int sessionSyncId = -1;
@@ -180,21 +244,57 @@ public class AutoSellPro extends Module {
     private boolean queueBuilt;
     private final ArrayDeque<Integer> touchQueue = new ArrayDeque<>();
     private int pendingPutBack = -1;
+    private int expectedFilled = -1;
+    private boolean verifyPending;
+    private int ackWait;
+    private int ackExtra;
+    private int rejects;
+    private boolean guiRetried;
+    private int resyncGap;
+    private boolean resyncNeeded;
 
-    // v2: server-ack tracking
-    private int expectedFilled = -1;   // how many GUI input slots we expect to be filled
-    private boolean verifyPending;     // a batch was sent and still has to be verified
-    private int ackWait;               // ticks left to wait for the server's answer
-    private int ackExtra;              // adaptive extra ticks (grows with rejects / latency)
-    private int rejects;               // real rejections in this session
-    private boolean guiRetried;        // /sell re-sent once while waiting for the GUI
-    private int resyncGap;             // pause between resync slot touches
-    private boolean resyncNeeded;      // did this session need a resync at all
+    // ghost slots: player-inventory slot (0..35 relative to the sell GUI) -> item + skip-until time
+    private record BadSlot(Item item, long until) {}
+    private final Map<Integer, BadSlot> badSlots = new HashMap<>();
+    private int lastClickedRel = -1;   // slot of the last batch when it contained exactly 1 click
+    private int lastBatchMoved;
+
+    // AUTO mode bookkeeping
+    private boolean autoSafe;      // true while AUTO is temporarily using SAFE behaviour
+    private int safeSellsLeft;     // clean SAFE sells left before trying FAST again
 
     public AutoSellPro() {
         super(AddonTemplate.CATEGORY, "auto-sell-pro",
-            "Bind to Z: sells all whitelisted items instantly via /sell, then keeps auto-selling whenever the inventory is full.");
+            "Bind to Z: sells all whitelisted items instantly via /sell, then keeps auto-selling whenever the inventory is full. Modes: AUTO / FAST / SAFE.");
     }
+
+    // ---------------- mode helpers ----------------
+
+    /** True when the SAFE (anti-ghost) behaviour is in effect right now. */
+    private boolean isSafe() {
+        return switch (mode.get()) {
+            case SAFE -> true;
+            case FAST -> false;
+            case AUTO -> autoSafe;
+        };
+    }
+
+    /** AUTO only: server pushed back -> use SAFE for the next few sells. */
+    private void escalateToSafe(String why) {
+        if (mode.get() != Mode.AUTO) return;
+        if (!autoSafe) {
+            info("Fast sell failed (" + why + ") - switching to SAFE mode for " + safeSellsBeforeFast.get() + " sells.");
+        }
+        autoSafe = true;
+        safeSellsLeft = safeSellsBeforeFast.get();
+        dbg("escalate to SAFE: " + why);
+    }
+
+    private long cleanCooldownMs() {
+        return (long) (isSafe() ? cooldownSeconds.get() : fastCooldown.get()) * 1000L;
+    }
+
+    // ---------------- lifecycle ----------------
 
     @Override
     public void onActivate() {
@@ -204,26 +304,34 @@ public class AutoSellPro extends Module {
         slowTicks = 0;
         cleanStreak = 0;
         ackExtra = 0;
+        autoSafe = false;
+        safeSellsLeft = 0;
+        badSlots.clear();
         forceSell = true;
     }
 
     @Override
     public void onDeactivate() {
         restoreKillAura();
-        // Do not leave the sell GUI open with clicks in flight.
-        if (mc.player != null && isSellScreen()) mc.player.closeHandledScreen();
+        if (mc.player != null && isSellScreen()) {
+            mc.player.closeHandledScreen();
+        }
         reset();
     }
 
     @Override
     public String getInfoString() {
-        return state == State.IDLE ? null : state.name();
+        String m = isSafe() ? "SAFE" : "FAST";
+        if (!badSlots.isEmpty()) m += " ghost:" + badSlots.size();
+        return state == State.IDLE ? m : m + " " + state.name();
     }
 
     @EventHandler
     private void onTick(TickEvent.Post event) {
-        if (mc.player == null || mc.world == null || mc.interactionManager == null || mc.getNetworkHandler() == null) return;
-        stateTicks++;
+        if (mc.player == null || mc.world == null || mc.interactionManager == null || mc.getNetworkHandler() == null) {
+            return;
+        }
+        ++stateTicks;
         try {
             switch (state) {
                 case IDLE -> tickIdle();
@@ -241,7 +349,7 @@ public class AutoSellPro extends Module {
         }
     }
 
-    // ------------------------------------------------------------------ states
+    // ---------------- state machine ----------------
 
     private void tickIdle() {
         if (System.currentTimeMillis() < cooldownEndTime) return;
@@ -256,7 +364,6 @@ public class AutoSellPro extends Module {
             info("No whitelisted items to sell.");
             return;
         }
-
         forceSell = false;
         round = 0;
         movedLastRound = 0;
@@ -266,8 +373,8 @@ public class AutoSellPro extends Module {
         ackWait = 0;
         rejects = 0;
         guiRetried = false;
-
-        dbg("start sell, whitelisted=" + count + " batch=" + adaptiveBatch + " slow=" + slowTicks + " ackExtra=" + ackExtra);
+        dbg("start sell, mode=" + (isSafe() ? "SAFE" : "FAST") + " whitelisted=" + count
+            + " batch=" + adaptiveBatch + " slow=" + slowTicks + " ackExtra=" + ackExtra);
         mc.getNetworkHandler().sendChatCommand(SELL_GUI_TITLE);
         setState(State.WAITING_GUI);
     }
@@ -279,16 +386,12 @@ public class AutoSellPro extends Module {
             setState(State.STABILIZING);
             return;
         }
-
         int timeoutTicks = guiTimeoutSeconds.get() * 20;
-
-        // The server sometimes swallows the first /sell (rate limit / lag). Retry once.
         if (!guiRetried && stateTicks > timeoutTicks / 2 && mc.currentScreen == null) {
             guiRetried = true;
             dbg("no sell GUI yet, re-sending /sell");
             mc.getNetworkHandler().sendChatCommand(SELL_GUI_TITLE);
         }
-
         if (stateTicks > timeoutTicks) {
             warning("Timed out waiting for the sell GUI.");
             abort(false);
@@ -300,7 +403,8 @@ public class AutoSellPro extends Module {
             abortManualClose();
             return;
         }
-        if (stateTicks >= stabilizeTicks.get()) {
+        int wait = isSafe() ? stabilizeTicks.get() : fastStabilize.get();
+        if (stateTicks >= wait) {
             expectedFilled = 0;
             verifyPending = false;
             ackWait = 0;
@@ -313,31 +417,29 @@ public class AutoSellPro extends Module {
             abortManualClose();
             return;
         }
-
         ScreenHandler handler = mc.player.currentScreenHandler;
         int invStart = handler.slots.size() - INVENTORY_SIZE;
 
-        // 1) Give the server time to answer the last batch. Do NOT judge the GUI yet.
         if (ackWait > 0) {
-            ackWait--;
+            --ackWait;
             return;
         }
 
-        // 2) The server had its time: now compare reality with what we expect.
         if (verifyPending) {
             verifyPending = false;
             int actual = guiFilled(handler);
             dbg("verify: expected=" + expectedFilled + " actual=" + actual);
             if (actual < expectedFilled) {
-                onReject(actual);
+                onReject(actual, true);
                 return;
             }
         }
 
-        // 3) Nothing left to move (or GUI full) -> confirm what is inside.
         if (!hasMovableLeft(handler, invStart)) {
             if (guiFilled(handler) == 0) {
-                if (round == 0) warning("Sell GUI input slots are full or nothing could be moved.");
+                if (round == 0) {
+                    warning("Sell GUI input slots are full or nothing could be moved.");
+                }
                 finish(true);
                 return;
             }
@@ -345,29 +447,36 @@ public class AutoSellPro extends Module {
             return;
         }
 
-        // 4) Send the next batch.
+        boolean safe = isSafe();
         if (adaptiveBatch <= 0) adaptiveBatch = batchSize.get();
-        int limit = Math.max(1, Math.min(adaptiveBatch, batchSize.get()));
+        int limit = safe ? Math.max(1, Math.min(adaptiveBatch, batchSize.get())) : fastBatch.get();
+
         int moved = 0;
-        for (int slot = invStart; slot < handler.slots.size() && moved < limit && freeInputSlots(handler) != 0; slot++) {
+        int clickedRel = -1;
+        for (int slot = invStart; slot < handler.slots.size() && moved < limit && freeInputSlots(handler) != 0; ++slot) {
             ItemStack stack = handler.getSlot(slot).getStack();
             if (stack.isEmpty() || !whitelist.get().contains(stack.getItem())) continue;
+            if (isGhostSlot(slot - invStart, stack)) continue;
             mc.interactionManager.clickSlot(handler.syncId, slot, 0, SlotActionType.QUICK_MOVE, mc.player);
-            moved++;
+            clickedRel = slot - invStart;
+            ++moved;
         }
-
+        lastBatchMoved = moved;
+        lastClickedRel = moved == 1 ? clickedRel : -1;
         movedLastRound += moved;
         expectedFilled = guiFilled(handler);
         verifyPending = true;
 
-        int jitter = batchJitter.get();
-        ackWait = Math.max(1, ackWaitTicks.get() + ackExtra + slowTicks + batchInterval.get() - 1
-            + (jitter > 0 ? ThreadLocalRandom.current().nextInt(jitter + 1) : 0));
-
+        if (safe) {
+            int jitter = batchJitter.get();
+            ackWait = Math.max(1, ackWaitTicks.get() + ackExtra + slowTicks + batchInterval.get() - 1
+                + (jitter > 0 ? ThreadLocalRandom.current().nextInt(jitter + 1) : 0));
+        } else {
+            ackWait = Math.max(1, fastAckWait.get());
+        }
         dbg("batch moved=" + moved + " limit=" + limit + " guiFilled=" + expectedFilled + " ackWait=" + ackWait);
 
         if (moved == 0) {
-            // freeInputSlots hit 0 mid-loop; nothing sent, go straight to confirm.
             verifyPending = false;
             ackWait = 0;
             if (guiFilled(handler) == 0) {
@@ -383,25 +492,24 @@ public class AutoSellPro extends Module {
             abortManualClose();
             return;
         }
-        if (stateTicks < confirmDelayTicks.get()) return;
+        int wait = isSafe() ? confirmDelayTicks.get() : fastConfirmDelay.get();
+        if (stateTicks < wait) return;
 
         ScreenHandler handler = mc.player.currentScreenHandler;
         int actual = guiFilled(handler);
-
         if (actual < expectedFilled) {
-            // Items disappeared from the GUI even after we waited for the server.
             dbg("confirm check: expected=" + expectedFilled + " actual=" + actual);
-            onReject(actual);
+            onReject(actual, false);
             return;
         }
         if (actual == 0) {
             warning("Server returned all moved items, cancelling this sell.");
             sessionFailed = true;
-            failStreak++;
+            ++failStreak;
+            escalateToSafe("server returned all items");
             beginResync(true, false, 0L);
             return;
         }
-
         mc.interactionManager.clickSlot(handler.syncId, CONFIRM_SLOT, 0, SlotActionType.PICKUP, mc.player);
         setState(State.WAITING_SALE);
     }
@@ -411,13 +519,13 @@ public class AutoSellPro extends Module {
             finish(false);
             return;
         }
-        if (stateTicks < postSellDelayTicks.get() + ackExtra) return;
+        int wait = isSafe() ? postSellDelayTicks.get() + ackExtra : fastPostSell.get();
+        if (stateTicks < wait) return;
 
         ScreenHandler handler = mc.player.currentScreenHandler;
         int invStart = handler.slots.size() - INVENTORY_SIZE;
-
         if (round + 1 < MAX_ROUNDS && movedLastRound > 0 && hasMovableLeft(handler, invStart)) {
-            round++;
+            ++round;
             movedLastRound = 0;
             expectedFilled = 0;
             verifyPending = false;
@@ -428,46 +536,44 @@ public class AutoSellPro extends Module {
         finish(true);
     }
 
-    // ------------------------------------------------------------------ resync (only when needed)
-
     private void tickResync() {
         if (isSellScreen()) {
             mc.player.closeHandledScreen();
             return;
         }
-        if (stateTicks < resyncDelayTicks.get() + ackExtra) return;
+        // A clean FAST session only waits a couple of ticks; failed/aborted sessions always use the safe delay.
+        boolean slow = isSafe() || resyncNeeded;
+        int wait = slow ? resyncDelayTicks.get() + ackExtra : fastCloseDelay.get();
+        if (stateTicks < wait) return;
 
         ScreenHandler handler = mc.player.currentScreenHandler;
         boolean isPlayerInv = mc.currentScreen == null && handler == mc.player.playerScreenHandler;
         if (!isPlayerInv) return;
 
-        if (!resyncEnabled.get() || !(resyncNeeded || resyncAlways.get())) {
+        boolean wantResync = resyncNeeded || (resyncAlways.get() && isSafe());
+        if (!resyncEnabled.get() || !wantResync) {
             completeSession();
             return;
         }
-
         if (resyncGap > 0) {
-            resyncGap--;
+            --resyncGap;
             return;
         }
-
         if (!queueBuilt) {
             touchQueue.clear();
             pendingPutBack = -1;
-            for (int slot = 9; slot <= INPUT_SLOT_END; slot++) {
-                if (handler.getSlot(slot).getStack().isEmpty()) continue;
-                touchQueue.add(slot);
+            for (int s = 9; s <= 44; ++s) {
+                if (handler.getSlot(s).getStack().isEmpty()) continue;
+                touchQueue.add(s);
             }
             queueBuilt = true;
             dbg("resync queue built: " + touchQueue.size() + " slots to touch");
         }
-
         Integer slot = touchQueue.poll();
         if (slot == null) {
             completeSession();
             return;
         }
-
         dbg("resync pickup slot " + slot);
         mc.interactionManager.clickSlot(handler.syncId, slot, 0, SlotActionType.PICKUP, mc.player);
         pendingPutBack = slot;
@@ -487,45 +593,51 @@ public class AutoSellPro extends Module {
             mc.interactionManager.clickSlot(handler.syncId, pendingPutBack, 0, SlotActionType.PICKUP, mc.player);
             pendingPutBack = -1;
         }
-        resyncGap = 2; // breathe between touches, the server does not like a constant click stream
+        resyncGap = 2;
         state = State.RESYNC;
     }
 
     private void completeSession() {
         long cooldownMs = resyncCooldownMs;
-        boolean disableModule = false;
 
         if (sessionFailed) {
+            escalateToSafe("session failed");
             long base = Math.max(1, cooldownSeconds.get());
             cooldownMs = Math.min(MAX_BACKOFF_SEC, base << Math.min(failStreak, 6)) * 1000L;
-            if (failStreak >= maxFails.get()) {
-                warning("Too many failed sells in a row - disabling auto-sell to avoid more ghost items.");
-                disableModule = true;
-            }
         } else if (resyncVerify) {
             dbg("session ok, whitelisted before=" + whitelistedBefore + " now=" + countWhitelistedInInventory());
             failStreak = 0;
-            cooldownMs = (long) cooldownSeconds.get() * 1000L;
+            cooldownMs = cleanCooldownMs();
+
+            // AUTO: after enough clean SAFE sells, try FAST again
+            if (mode.get() == Mode.AUTO && autoSafe && --safeSellsLeft <= 0) {
+                autoSafe = false;
+                info("Back to FAST mode.");
+            }
+
             if (++cleanStreak >= 3) {
                 cleanStreak = 0;
-                if (slowTicks > 0) slowTicks--;
-                else if (ackExtra > 0) ackExtra--;
-                else adaptiveBatch = Math.min(batchSize.get(), adaptiveBatch + 1);
+                if (slowTicks > 0) {
+                    --slowTicks;
+                } else if (ackExtra > 0) {
+                    --ackExtra;
+                } else {
+                    adaptiveBatch = Math.min(batchSize.get(), adaptiveBatch + 1);
+                }
             }
         }
-
         restoreKillAura();
         reset();
         cooldownEndTime = System.currentTimeMillis() + cooldownMs;
-        if (disableModule) toggle();
     }
 
     private void beginResync(boolean closeGui, boolean verify, long cooldownMs) {
-        if (closeGui && mc.player != null && isSellScreen()) mc.player.closeHandledScreen();
+        if (closeGui && mc.player != null && isSellScreen()) {
+            mc.player.closeHandledScreen();
+        }
         restoreKillAura();
         resyncVerify = verify;
         resyncCooldownMs = cooldownMs;
-        // A clean, verified session needs no resync. Failures/aborts do.
         resyncNeeded = !verify || sessionFailed;
         queueBuilt = false;
         touchQueue.clear();
@@ -535,7 +647,7 @@ public class AutoSellPro extends Module {
     }
 
     private void finish(boolean closeGui) {
-        beginResync(closeGui, true, (long) cooldownSeconds.get() * 1000L);
+        beginResync(closeGui, true, cleanCooldownMs());
     }
 
     private void abort(boolean closeGui) {
@@ -547,30 +659,46 @@ public class AutoSellPro extends Module {
         beginResync(false, false, (long) manualCloseDelaySeconds.get() * 1000L);
     }
 
-    /**
-     * The GUI holds fewer items than expected EVEN AFTER the server had time to answer:
-     * wait longer / go slower and just re-move the missing stacks. Close the GUI only if it keeps happening.
-     */
-    private void onReject(int actual) {
-        rejects++;
+    private void onReject(int actual, boolean fromVerify) {
+        // Exactly one stack was clicked and the server gave it back -> that slot is a ghost item.
+        // Skip it for a while and keep selling the rest (no slowdown, no failure).
+        if (fromVerify && lastBatchMoved == 1 && lastClickedRel >= 0) {
+            ScreenHandler handler = mc.player.currentScreenHandler;
+            int invStart = handler.slots.size() - INVENTORY_SIZE;
+            ItemStack st = handler.getSlot(invStart + lastClickedRel).getStack();
+            if (!st.isEmpty()) {
+                badSlots.put(lastClickedRel, new BadSlot(st.getItem(), System.currentTimeMillis() + ghostRetryMinutes.get() * 60_000L));
+                dbg("GHOST slot rel=" + lastClickedRel + " item=" + st.getItem() + " -> skipped " + ghostRetryMinutes.get() + " min");
+                escalateToSafe("ghost slot " + lastClickedRel);
+                expectedFilled = actual;
+                verifyPending = false;
+                ackWait = isSafe() ? ackWaitTicks.get() + ackExtra : fastAckWait.get() * 2;
+                lastClickedRel = -1;
+                if (state != State.MOVING) setState(State.MOVING);
+                return;
+            }
+        }
+
+        ++rejects;
+        escalateToSafe("server returned items");
         ackExtra = Math.min(MAX_ACK_EXTRA, ackExtra + 2);
         adaptiveBatch = Math.max(1, adaptiveBatch / 2);
         slowTicks = Math.min(4, slowTicks + 1);
         cleanStreak = 0;
-        dbg("REJECT #" + rejects + " expected=" + expectedFilled + " actual=" + actual + " ackExtra=" + ackExtra + " batch=" + adaptiveBatch);
+        dbg("REJECT #" + rejects + " expected=" + expectedFilled + " actual=" + actual
+            + " ackExtra=" + ackExtra + " batch=" + adaptiveBatch);
 
         if (rejects > MAX_REJECTS_PER_SESSION) {
             sessionFailed = true;
-            failStreak++;
+            ++failStreak;
             warning("Server keeps returning items. Slowing down: batch " + adaptiveBatch + ", ack +" + ackExtra
-                + " ticks. (" + failStreak + "/" + maxFails.get() + ")");
+                + " ticks. (fail streak " + failStreak + ")");
             beginResync(true, false, 0L);
             return;
         }
-
         expectedFilled = actual;
         verifyPending = false;
-        ackWait = ackWaitTicks.get() + ackExtra;
+        ackWait = isSafe() ? ackWaitTicks.get() + ackExtra : fastAckWait.get() * 2;
         if (state != State.MOVING) setState(State.MOVING);
     }
 
@@ -609,37 +737,54 @@ public class AutoSellPro extends Module {
         }
     }
 
-    // ------------------------------------------------------------------ helpers
+    // ---------------- inventory helpers ----------------
+
+    /** Inventory index (0-8 hotbar, 9-35 main) -> slot index relative to the start of the player part of a container GUI. */
+    private static int toRel(int invIndex) {
+        return invIndex < 9 ? 27 + invIndex : invIndex - 9;
+    }
+
+    /** True if this slot is a known ghost item (still shows the same item, skip time not over). Cleans up stale entries. */
+    private boolean isGhostSlot(int rel, ItemStack stack) {
+        BadSlot b = badSlots.get(rel);
+        if (b == null) return false;
+        if (stack.isEmpty() || stack.getItem() != b.item() || System.currentTimeMillis() > b.until()) {
+            badSlots.remove(rel);
+            return false;
+        }
+        return true;
+    }
 
     private boolean shouldAutoSell() {
         int free = 0;
         int whitelisted = 0;
-        for (int i = 0; i < INVENTORY_SIZE; i++) {
+        for (int i = 0; i < INVENTORY_SIZE; ++i) {
             ItemStack s = mc.player.getInventory().getStack(i);
             if (s.isEmpty()) {
-                free++;
+                ++free;
                 continue;
             }
-            if (whitelist.get().contains(s.getItem())) whitelisted++;
+            if (whitelist.get().contains(s.getItem()) && !isGhostSlot(toRel(i), s)) ++whitelisted;
         }
-        return free == 0 && whitelisted >= minStacks.get();
+        return free <= triggerFreeSlots.get() && whitelisted >= minStacks.get();
     }
 
     private int countWhitelistedInInventory() {
         int n = 0;
-        for (int i = 0; i < INVENTORY_SIZE; i++) {
+        for (int i = 0; i < INVENTORY_SIZE; ++i) {
             ItemStack s = mc.player.getInventory().getStack(i);
-            if (s.isEmpty() || !whitelist.get().contains(s.getItem())) continue;
-            n++;
+            if (s.isEmpty() || !whitelist.get().contains(s.getItem()) || isGhostSlot(toRel(i), s)) continue;
+            ++n;
         }
         return n;
     }
 
     private boolean hasMovableLeft(ScreenHandler handler, int invStart) {
         if (freeInputSlots(handler) == 0) return false;
-        for (int i = invStart; i < handler.slots.size(); i++) {
+        for (int i = invStart; i < handler.slots.size(); ++i) {
             ItemStack stack = handler.getSlot(i).getStack();
             if (stack.isEmpty() || !whitelist.get().contains(stack.getItem())) continue;
+            if (isGhostSlot(i - invStart, stack)) continue;
             return true;
         }
         return false;
@@ -647,8 +792,9 @@ public class AutoSellPro extends Module {
 
     private int freeInputSlots(ScreenHandler handler) {
         int free = 0;
-        for (int i = 0; i <= INPUT_SLOT_END; i++) {
-            if (!handler.getSlot(i).hasStack()) free++;
+        for (int i = 0; i <= INPUT_SLOT_END; ++i) {
+            if (handler.getSlot(i).hasStack()) continue;
+            ++free;
         }
         return free;
     }
