@@ -14,6 +14,7 @@ import meteordevelopment.meteorclient.systems.modules.combat.KillAura;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
 import net.minecraft.screen.GenericContainerScreenHandler;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
@@ -52,6 +53,20 @@ public class AutoSellPro extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgFast = settings.createGroup("Fast mode");
     private final SettingGroup sgDelays = settings.createGroup("Delays (safe mode)");
+    private final SettingGroup sgWither = settings.createGroup("Auto sell skeleton wither");
+
+    // ---------------- auto sell skeleton wither ----------------
+    private final Setting<Boolean> witherMode = sgWither.add(new BoolSetting.Builder()
+        .name("wither-skeleton-mode")
+        .description("Only sells BONE and COAL (ignores the whitelist, never sells skulls / anything else). Every stack is sold with 1 item left in the slot (63 of 64), so the inventory stays full and you never pick up stone swords. Works together with AUTO / FAST / SAFE.")
+        .defaultValue(false)
+        .build());
+
+    private final Setting<Integer> witherMinStack = sgWither.add(new IntSetting.Builder()
+        .name("wither-min-stack")
+        .description("A bone/coal stack is only sold when it has at least this many items (64 = full stacks only, sells 63 and keeps 1).")
+        .defaultValue(64).range(2, 64).sliderRange(2, 64)
+        .build());
 
     // ---------------- general ----------------
     private final Setting<Mode> mode = sgGeneral.add(new EnumSetting.Builder<Mode>()
@@ -322,6 +337,7 @@ public class AutoSellPro extends Module {
     @Override
     public String getInfoString() {
         String m = isSafe() ? "SAFE" : "FAST";
+        if (witherMode.get()) m += " WITHER";
         if (!badSlots.isEmpty()) m += " ghost:" + badSlots.size();
         return state == State.IDLE ? m : m + " " + state.name();
     }
@@ -455,9 +471,13 @@ public class AutoSellPro extends Module {
         int clickedRel = -1;
         for (int slot = invStart; slot < handler.slots.size() && moved < limit && freeInputSlots(handler) != 0; ++slot) {
             ItemStack stack = handler.getSlot(slot).getStack();
-            if (stack.isEmpty() || !whitelist.get().contains(stack.getItem())) continue;
+            if (!isSellable(stack)) continue;
             if (isGhostSlot(slot - invStart, stack)) continue;
-            mc.interactionManager.clickSlot(handler.syncId, slot, 0, SlotActionType.QUICK_MOVE, mc.player);
+            if (witherMode.get()) {
+                if (!moveAllButOne(handler, slot)) break;
+            } else {
+                mc.interactionManager.clickSlot(handler.syncId, slot, 0, SlotActionType.QUICK_MOVE, mc.player);
+            }
             clickedRel = slot - invStart;
             ++moved;
         }
@@ -764,7 +784,7 @@ public class AutoSellPro extends Module {
                 ++free;
                 continue;
             }
-            if (whitelist.get().contains(s.getItem()) && !isGhostSlot(toRel(i), s)) ++whitelisted;
+            if (isSellable(s) && !isGhostSlot(toRel(i), s)) ++whitelisted;
         }
         return free <= triggerFreeSlots.get() && whitelisted >= minStacks.get();
     }
@@ -773,7 +793,7 @@ public class AutoSellPro extends Module {
         int n = 0;
         for (int i = 0; i < INVENTORY_SIZE; ++i) {
             ItemStack s = mc.player.getInventory().getStack(i);
-            if (s.isEmpty() || !whitelist.get().contains(s.getItem()) || isGhostSlot(toRel(i), s)) continue;
+            if (!isSellable(s) || isGhostSlot(toRel(i), s)) continue;
             ++n;
         }
         return n;
@@ -783,11 +803,51 @@ public class AutoSellPro extends Module {
         if (freeInputSlots(handler) == 0) return false;
         for (int i = invStart; i < handler.slots.size(); ++i) {
             ItemStack stack = handler.getSlot(i).getStack();
-            if (stack.isEmpty() || !whitelist.get().contains(stack.getItem())) continue;
+            if (!isSellable(stack)) continue;
             if (isGhostSlot(i - invStart, stack)) continue;
             return true;
         }
         return false;
+    }
+
+    /**
+     * Whether a stack may be sold right now.
+     * Normal: item is in the whitelist.
+     * Wither skeleton mode: only BONE / COAL (whitelist ignored, skulls never), and only stacks with
+     * at least wither-min-stack items (so the 1 item we keep behind is never sold again).
+     */
+    private boolean isSellable(ItemStack stack) {
+        if (stack.isEmpty()) return false;
+        if (witherMode.get()) {
+            Item it = stack.getItem();
+            return (it == Items.BONE || it == Items.COAL) && stack.getCount() >= Math.max(2, witherMinStack.get());
+        }
+        return whitelist.get().contains(stack.getItem());
+    }
+
+    /**
+     * Moves (count - 1) items of the stack in {@code slot} into the first free sell-input slot and leaves
+     * exactly 1 item behind: pick up all, right-click the origin slot (puts 1 back), place the rest.
+     * Returns false if there is no free input slot.
+     */
+    private boolean moveAllButOne(ScreenHandler handler, int slot) {
+        int target = -1;
+        for (int i = 0; i <= INPUT_SLOT_END; ++i) {
+            if (!handler.getSlot(i).hasStack()) {
+                target = i;
+                break;
+            }
+        }
+        if (target < 0) return false;
+        int id = handler.syncId;
+        mc.interactionManager.clickSlot(id, slot, 0, SlotActionType.PICKUP, mc.player);   // pick up whole stack
+        mc.interactionManager.clickSlot(id, slot, 1, SlotActionType.PICKUP, mc.player);   // put 1 back
+        mc.interactionManager.clickSlot(id, target, 0, SlotActionType.PICKUP, mc.player); // drop the rest into the sell GUI
+        if (!handler.getCursorStack().isEmpty()) {
+            // something went wrong: return whatever is on the cursor to the original slot
+            mc.interactionManager.clickSlot(id, slot, 0, SlotActionType.PICKUP, mc.player);
+        }
+        return true;
     }
 
     private int freeInputSlots(ScreenHandler handler) {
